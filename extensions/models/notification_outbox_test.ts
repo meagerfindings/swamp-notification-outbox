@@ -20,13 +20,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-import { assert, assertEquals } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { z } from "npm:zod@4";
 import {
+  classifyTransportError,
   drainNotificationsFold,
   model,
-  NotificationSchema,
   notificationDedupKey,
+  NotificationSchema,
   notificationToEnqueue,
   type OutboxMethodContext,
   redactNotificationPayload,
@@ -49,10 +50,29 @@ type WrittenResource = {
 function testContext(): {
   context: OutboxMethodContext;
   getWrittenResources: () => WrittenResource[];
+  setLatestResource: (name: string, data: unknown) => void;
+  setLatestRawContent: (name: string, data: Uint8Array) => void;
 } {
   const written: WrittenResource[] = [];
+  const latest = new Map<string, unknown>();
+  const rawContent = new Map<string, Uint8Array>();
+  const encoder = new TextEncoder();
   const context: OutboxMethodContext = {
+    modelType: "@mgreten/notification-outbox",
+    modelId: "test-outbox",
     globalArgs: {},
+    dataRepository: {
+      getContent: (_modelType, _modelId, name) => {
+        const raw = rawContent.get(name);
+        if (raw !== undefined) return Promise.resolve(raw);
+        const resource = latest.get(name);
+        return Promise.resolve(
+          resource === undefined
+            ? null
+            : encoder.encode(JSON.stringify(resource)),
+        );
+      },
+    },
     logger: {
       info: () => {},
       warning: () => {},
@@ -66,11 +86,23 @@ function testContext(): {
         tags: overrides?.tags,
       };
       written.push(record);
+      latest.set(name, data);
       // deno-lint-ignore no-explicit-any
       return Promise.resolve(record as any);
     },
   };
-  return { context, getWrittenResources: () => written };
+  return {
+    context,
+    getWrittenResources: () => written,
+    setLatestResource: (name, data) => {
+      rawContent.delete(name);
+      latest.set(name, data);
+    },
+    setLatestRawContent: (name, data) => {
+      latest.delete(name);
+      rawContent.set(name, data);
+    },
+  };
 }
 
 Deno.test("redactNotificationPayload strips secrets by key, secret-shaped values, and absolute paths", () => {
@@ -133,6 +165,7 @@ Deno.test("notificationToEnqueue redacts and builds a pending record when no pri
   assertEquals(record!.status, "pending");
   assertEquals(record!.attempts, 0);
   assertEquals(record!.event, "approval-needed");
+  assertEquals(record!.redactionVersion, "2");
   assertEquals(
     (record!.payload as Record<string, unknown>).token,
     "[REDACTED]",
@@ -238,6 +271,98 @@ function pendingNotification(dedupKey = "failed-deadbeef") {
   });
 }
 
+Deno.test("classifyTransportError makes every supplied error non-data-bearing", () => {
+  const rawErrors = [
+    "connection refused",
+    "request failed; bearer abc",
+    "authentication failed",
+    "transport token expired",
+    "invalid API-key supplied",
+    "password rejected",
+    "cookie parse failure",
+    "unable to load private-key",
+    "upstream returned ghp_abc123",
+    "Slack rejected xoxb-123",
+    "provider rejected sk-live123",
+    "JWT eyJhbGciOiJIUzI1NiJ9 rejected",
+    "fetch https://user:pass@example.com/hook failed",
+    "failed reading /home/mat/.config/service",
+    String.raw`failed reading C:\Users\mat\secret.txt`,
+    "opaque AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_- value",
+    "line one\nline two",
+    "x".repeat(201),
+  ];
+
+  for (const [index, rawError] of rawErrors.entries()) {
+    assertEquals(
+      classifyTransportError(rawError),
+      "transport delivery failed",
+      rawError,
+    );
+    const pending = pendingNotification(`failed-classify${index}`);
+    const [drained] = drainNotificationsFold(
+      [pending],
+      [{ dedupKey: pending.dedupKey, delivered: false, error: rawError }],
+      ERA_B,
+    );
+    assertEquals(drained.lastError, "transport delivery failed");
+    assert(!JSON.stringify(drained).includes(rawError), rawError);
+  }
+});
+
+Deno.test("drainNotificationsFold omits lastError when no raw error is supplied", () => {
+  const pending = pendingNotification("failed-noerror11");
+  const [drained] = drainNotificationsFold(
+    [pending],
+    [{ dedupKey: pending.dedupKey, delivered: false }],
+    ERA_B,
+  );
+  assertEquals(drained.status, "failed");
+  assertEquals(drained.lastError, undefined);
+  assert(!Object.hasOwn(drained, "lastError"));
+});
+
+Deno.test("errorless retry of a legacy failed record removes inherited lastError", () => {
+  const legacy = NotificationSchema.parse({
+    ...pendingNotification("failed-legacyraw1"),
+    status: "failed",
+    attempts: 2,
+    lastError: "RAW_SECRET_ERROR",
+  });
+
+  const [drained] = drainNotificationsFold(
+    [legacy],
+    [{ dedupKey: legacy.dedupKey, delivered: false }],
+    ERA_B,
+  );
+
+  assertEquals(drained.status, "failed");
+  assertEquals(drained.attempts, 3);
+  assertEquals(drained.redactionVersion, "1");
+  assert(!Object.hasOwn(drained, "lastError"));
+  assert(!JSON.stringify(drained).includes("RAW_SECRET_ERROR"));
+});
+
+Deno.test("v1 records remain parseable and drain without upgrading their persisted version", () => {
+  const legacy = pendingNotification("failed-legacy111");
+  assertEquals(legacy.redactionVersion, "1");
+
+  const [drained] = drainNotificationsFold(
+    [legacy],
+    [{
+      dedupKey: legacy.dedupKey,
+      delivered: false,
+      error: "connection refused",
+    }],
+    ERA_B,
+  );
+
+  assertEquals(drained.status, "failed");
+  assertEquals(drained.lastError, "transport delivery failed");
+  assertEquals(drained.redactionVersion, "1");
+  assert(NotificationSchema.safeParse(drained).success);
+});
+
 Deno.test("drainNotificationsFold marks delivered and failed, bumping attempts on failure only", () => {
   const a = pendingNotification("failed-aaaa1111");
   const b = pendingNotification("failed-bbbb2222");
@@ -258,7 +383,10 @@ Deno.test("drainNotificationsFold marks delivered and failed, bumping attempts o
   assertEquals(byKey.get("failed-aaaa1111")!.attempts, 0);
   assertEquals(byKey.get("failed-bbbb2222")!.status, "failed");
   assertEquals(byKey.get("failed-bbbb2222")!.attempts, 1);
-  assertEquals(byKey.get("failed-bbbb2222")!.lastError, "connection refused");
+  assertEquals(
+    byKey.get("failed-bbbb2222")!.lastError,
+    "transport delivery failed",
+  );
 });
 
 Deno.test("drainNotificationsFold is idempotent: re-draining a delivered record is a no-op; a redelivery of a failed one bumps attempts again", () => {
@@ -299,7 +427,7 @@ Deno.test("drainNotificationsFold is idempotent: re-draining a delivered record 
   assertEquals(untouched[0].attempts, 0);
 });
 
-Deno.test("enqueueNotification method persists a redacted pending record and dedups on retry", async () => {
+Deno.test("enqueueNotification persists a redacted record and atomically dedups a retry without caller existing", async () => {
   const test = testContext();
   await model.methods.enqueueNotification.execute(
     {
@@ -325,7 +453,8 @@ Deno.test("enqueueNotification method persists a redacted pending record and ded
   const name = written[0].name;
   assertEquals(name, "notification-WI-801-completed");
 
-  // A retry with the prior record as `existing` dedups: no new resource.
+  // The in-memory repository now exposes the authoritative latest resource. A
+  // retry without caller-provided `existing` dedups and writes no new version.
   await model.methods.enqueueNotification.execute(
     {
       workItem: "WI-801",
@@ -333,12 +462,133 @@ Deno.test("enqueueNotification method persists a redacted pending record and ded
       urgency: "default",
       era: ERA_A,
       payload: {},
-      existing: record,
     },
     test.context,
   );
   written = test.getWrittenResources();
   assertEquals(written.length, 1, "a dedup hit must write nothing");
+});
+
+Deno.test("persisted pending or delivered records win over stale or absent caller existing", async () => {
+  for (const status of ["pending", "delivered"] as const) {
+    const test = testContext();
+    const name = "notification-WI-802-failed";
+    const persisted = NotificationSchema.parse({
+      ...pendingNotification(notificationDedupKey("WI-802", "failed", ERA_A)),
+      workItem: "WI-802",
+      status,
+    });
+    test.setLatestResource(name, persisted);
+
+    const staleCaller = NotificationSchema.parse({
+      ...persisted,
+      status: "failed",
+      era: ERA_B,
+      dedupKey: notificationDedupKey("WI-802", "failed", ERA_B),
+    });
+    await model.methods.enqueueNotification.execute(
+      {
+        workItem: "WI-802",
+        event: "failed",
+        urgency: "default",
+        era: ERA_A,
+        payload: {},
+        existing: status === "pending" ? staleCaller : undefined,
+      },
+      test.context,
+    );
+
+    assertEquals(
+      test.getWrittenResources().length,
+      0,
+      `persisted ${status} must dedup regardless of caller existing`,
+    );
+  }
+});
+
+Deno.test("malformed persisted JSON fails safely without writing", async () => {
+  const test = testContext();
+  test.setLatestRawContent(
+    "notification-WI-803-completed",
+    new TextEncoder().encode('{"workItem":"secret-content"'),
+  );
+
+  const error = await assertRejects(
+    () =>
+      model.methods.enqueueNotification.execute(
+        {
+          workItem: "WI-803",
+          event: "completed",
+          urgency: "default",
+          era: ERA_A,
+          payload: {},
+        },
+        test.context,
+      ),
+    Error,
+    "Persisted notification record is invalid",
+  );
+  assertEquals(error.message, "Persisted notification record is invalid");
+  assertEquals(test.getWrittenResources().length, 0);
+});
+
+Deno.test("malformed persisted schema fails safely without writing", async () => {
+  const test = testContext();
+  test.setLatestResource("notification-WI-803-completed", {
+    workItem: "WI-803",
+    status: "pending",
+  });
+
+  const error = await assertRejects(
+    () =>
+      model.methods.enqueueNotification.execute(
+        {
+          workItem: "WI-803",
+          event: "completed",
+          urgency: "default",
+          era: ERA_A,
+          payload: {},
+        },
+        test.context,
+      ),
+    Error,
+    "Persisted notification record is invalid",
+  );
+  assertEquals(error.message, "Persisted notification record is invalid");
+  assertEquals(test.getWrittenResources().length, 0);
+});
+
+Deno.test("a failed persisted record can be atomically re-enqueued", async () => {
+  const test = testContext();
+  const name = "notification-WI-804-failed";
+  test.setLatestResource(
+    name,
+    NotificationSchema.parse({
+      ...pendingNotification(notificationDedupKey("WI-804", "failed", ERA_A)),
+      workItem: "WI-804",
+      status: "failed",
+      attempts: 2,
+    }),
+  );
+
+  await model.methods.enqueueNotification.execute(
+    {
+      workItem: "WI-804",
+      event: "failed",
+      urgency: "high",
+      era: ERA_A,
+      payload: { reason: "retry" },
+    },
+    test.context,
+  );
+
+  const written = test.getWrittenResources();
+  assertEquals(written.length, 1);
+  assertEquals(written[0].name, name);
+  const record = NotificationSchema.parse(written[0].data);
+  assertEquals(record.status, "pending");
+  assertEquals(record.attempts, 0);
+  assertEquals(record.urgency, "high");
 });
 
 Deno.test("drainNotifications method rewrites only notification records", async () => {
