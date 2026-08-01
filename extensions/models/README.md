@@ -30,7 +30,7 @@ The model has no required global arguments. Create an instance:
 ```sh
 swamp model create outbox \
   --type @mgreten/notification-outbox \
-  --type-version 2026.08.01.1
+  --type-version 2026.08.01.2
 ```
 
 ## Usage
@@ -83,8 +83,12 @@ Enqueue a transport-neutral, redacted notification, deduplicated on
 ## Method: drainNotifications
 
 Fold pending records with the transport results the caller obtained, marking
-each `delivered` or `failed`. Idempotent: a delivered record is terminal; a
-record with no matching transport result is left untouched.
+each `delivered` or `failed`. While holding Swamp's per-model-instance method
+lock, drain re-reads each stable notification instance and writes only when its
+authoritative current `dedupKey` still matches the caller record. A stale result
+from an older era therefore returns no handle and cannot overwrite a newer era.
+A delivered current record is terminal; a record with no matching transport
+result is left untouched.
 
 | Argument           | Type                                       | Default | Description                           |
 | ------------------ | ------------------------------------------ | ------- | ------------------------------------- |
@@ -108,16 +112,30 @@ This read/derive/write sequence is atomic because Swamp serializes methods with
 its per-model-instance method lock. Deployments embedding the model must retain
 that locking guarantee; the model does not add a separate cross-process lock.
 
-`drainNotifications` performs a pure fold over the pending records and the
-transport results — no external reads, no transport calls. A `delivered:true`
-result marks the record delivered; anything else sets `failed`, increments
-`attempts`, and records the fixed classification `transport delivery failed` as
-`lastError` when the caller supplied any error. Raw transport errors are never
-persisted, regardless of their contents; callers should keep transport
-diagnostics outside the outbox. When the result omits `error`, the record also
-omits `lastError`. Re-draining a delivered record is a no-op, and a record
-without a matching result stays pending. The only dependency is `npm:zod@4` for
-schema validation.
+`drainNotifications` performs no transport calls. Under Swamp's
+per-model-instance method lock, it strictly reads the authoritative latest value
+for each caller notification's stable instance. It folds and writes that current
+record only when its `dedupKey` matches the caller's; an absent current record or
+a different key (including a newer era) is skipped with no data handle. Malformed
+persisted state fails closed with the same fixed, non-data-bearing error used by
+enqueue. The fold uses current status and attempts, so delivered remains terminal
+and retries increment the authoritative attempt count rather than a stale caller
+copy.
+
+A `delivered:true` result marks a non-terminal current record delivered;
+anything else sets `failed`, increments `attempts`, and records the fixed
+classification `transport delivery failed` as `lastError` when the caller
+supplied any error. Raw transport errors are never persisted, regardless of
+their contents; callers should keep transport diagnostics outside the outbox.
+When the result omits `error`, the record also omits `lastError`. A current record
+without a matching result is rewritten unchanged. The only dependency is
+`npm:zod@4` for schema validation.
+
+This closes the storage-side stale-write race, but delivery remains
+**at-least-once** across the transport/storage boundary: the caller's transport
+may succeed and the process may fail before drain persists `delivered`, causing
+a later retry to deliver again. Transports should use `dedupKey` as their
+idempotency key when they support one.
 
 ### Redaction version upgrades
 

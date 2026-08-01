@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/notification-outbox"
-version: "2026.08.01.1"
+version: "2026.08.01.2"
 description: >
   A transport-neutral, secret-redacting notification outbox for swamp workflows
   that enqueues deduplicated notification records and drains them through a

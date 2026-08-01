@@ -591,9 +591,128 @@ Deno.test("a failed persisted record can be atomically re-enqueued", async () =>
   assertEquals(record.urgency, "high");
 });
 
+Deno.test("stale drain cannot overwrite a newer persisted era", async () => {
+  const test = testContext();
+  const oldRecord = pendingNotification(
+    notificationDedupKey("WI-805", "failed", ERA_A),
+  );
+  const newerRecord = NotificationSchema.parse({
+    ...oldRecord,
+    dedupKey: notificationDedupKey("WI-805", "failed", ERA_B),
+    era: ERA_B,
+    attempts: 3,
+    enqueuedAt: ERA_B,
+    updatedAt: ERA_B,
+  });
+  const name = "notification-WI-805-failed";
+  test.setLatestResource(name, newerRecord);
+
+  const result = await model.methods.drainNotifications.execute(
+    {
+      notifications: [oldRecord],
+      transportResults: [{ dedupKey: oldRecord.dedupKey, delivered: true }],
+    },
+    test.context,
+  );
+
+  assertEquals(result.dataHandles, []);
+  assertEquals(test.getWrittenResources().length, 0);
+  // The authoritative object remains exactly the newer era record.
+  assertEquals(newerRecord.era, ERA_B);
+  assertEquals(newerRecord.attempts, 3);
+  assertEquals(newerRecord.status, "pending");
+});
+
+Deno.test("drain folds a same-key failure from authoritative current attempts", async () => {
+  const test = testContext();
+  const caller = pendingNotification("failed-current1");
+  const current = NotificationSchema.parse({
+    ...caller,
+    status: "failed",
+    attempts: 4,
+    updatedAt: ERA_B,
+  });
+  test.setLatestResource("notification-WI-800-failed", current);
+
+  const result = await model.methods.drainNotifications.execute(
+    {
+      notifications: [caller],
+      transportResults: [{
+        dedupKey: caller.dedupKey,
+        delivered: false,
+        error: "secret transport detail",
+      }],
+    },
+    test.context,
+  );
+
+  assertEquals(result.dataHandles?.length, 1);
+  const [write] = test.getWrittenResources();
+  const updated = NotificationSchema.parse(write.data);
+  assertEquals(updated.status, "failed");
+  assertEquals(updated.attempts, 5);
+  assertEquals(updated.lastError, "transport delivery failed");
+});
+
+Deno.test("malformed authoritative current fails drain safely without writing", async () => {
+  const test = testContext();
+  const caller = pendingNotification("failed-malformed1");
+  test.setLatestRawContent(
+    "notification-WI-800-failed",
+    new TextEncoder().encode('{"dedupKey":"failed-malformed1"'),
+  );
+
+  const error = await assertRejects(
+    () =>
+      model.methods.drainNotifications.execute(
+        {
+          notifications: [caller],
+          transportResults: [{ dedupKey: caller.dedupKey, delivered: true }],
+        },
+        test.context,
+      ),
+    Error,
+    "Persisted notification record is invalid",
+  );
+  assertEquals(error.message, "Persisted notification record is invalid");
+  assertEquals(test.getWrittenResources().length, 0);
+});
+
+Deno.test("ordinary drain success and failure still write authoritative records", async () => {
+  const test = testContext();
+  const success = pendingNotification("failed-success11");
+  const failure = NotificationSchema.parse({
+    ...pendingNotification("completed-failure1"),
+    event: "completed",
+  });
+  test.setLatestResource("notification-WI-800-failed", success);
+  test.setLatestResource("notification-WI-800-completed", failure);
+
+  const result = await model.methods.drainNotifications.execute(
+    {
+      notifications: [success, failure],
+      transportResults: [
+        { dedupKey: success.dedupKey, delivered: true },
+        { dedupKey: failure.dedupKey, delivered: false },
+      ],
+    },
+    test.context,
+  );
+
+  assertEquals(result.dataHandles?.length, 2);
+  const written = test.getWrittenResources().map((resource) =>
+    NotificationSchema.parse(resource.data)
+  );
+  assertEquals(written[0].status, "delivered");
+  assertEquals(written[0].attempts, 0);
+  assertEquals(written[1].status, "failed");
+  assertEquals(written[1].attempts, 1);
+});
+
 Deno.test("drainNotifications method rewrites only notification records", async () => {
   const test = testContext();
   const pending = pendingNotification("failed-cccc3333");
+  test.setLatestResource("notification-WI-800-failed", pending);
   await model.methods.drainNotifications.execute(
     {
       notifications: [pending],
